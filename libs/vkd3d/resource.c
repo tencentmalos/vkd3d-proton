@@ -722,6 +722,122 @@ static bool d3d12_device_supports_universal_color_ds_copy(struct d3d12_device *d
     return true;
 }
 
+static uint32_t vkd3d_xrgame_mip_cap(void)
+{
+    /* Largest level, by its longer side, that the Vulkan image keeps. A fixed cap rather than
+     * a per-texture drop keeps equal-sized levels of different textures in step, so copies
+     * between them (texture streaming) find both levels or neither. */
+    switch (vkd3d_xrgame_config.texture_quality)
+    {
+        case VKD3D_XRGAME_TEXTURE_QUALITY_MEDIUM:
+            return 1024;
+        case VKD3D_XRGAME_TEXTURE_QUALITY_LOW:
+            return 512;
+        default:
+            return 0;
+    }
+}
+
+/* Decides from the description and heap alone, so that GetResourceAllocationInfo and the
+ * placed resource that follows it agree on the image size. */
+static void vkd3d_xrgame_get_reduction(const D3D12_HEAP_PROPERTIES *heap_properties, bool shared,
+        const D3D12_RESOURCE_DESC1 *desc, const struct vkd3d_format *format,
+        uint32_t *mip_drop, uint32_t *scale_percent)
+{
+    uint32_t cap, levels, size, short_side, width, height;
+
+    *mip_drop = 0;
+    *scale_percent = 0;
+
+    /* Reserved, CPU-visible and shared resources keep their exact layout. */
+    if (!heap_properties || is_cpu_accessible_heap(heap_properties) || shared)
+        return;
+    if (desc->Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc->SampleDesc.Count != 1 ||
+            desc->Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN || d3d12_resource_desc_is_sampler_feedback(desc))
+        return;
+    if (desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER |
+            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+        return;
+
+    width = desc->Width;
+    height = desc->Height;
+    levels = min(desc->MipLevels, max_miplevel_count(desc));
+
+    if ((cap = vkd3d_xrgame_mip_cap()) && format->vk_aspect_mask == VK_IMAGE_ASPECT_COLOR_BIT && levels >= 2 &&
+            !(desc->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+            D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)))
+    {
+        size = max(width, height);
+        while (*mip_drop + 1 < levels && (size >> *mip_drop) > cap)
+            ++*mip_drop;
+    }
+
+    /* Shadow-like depth: arrays of large layers. Single large square maps are left alone;
+     * in Half-Life: Alyx they were also bound with full-size render targets. The main depth
+     * buffer matches the swapchain and is not an array. */
+    if (vkd3d_xrgame_config.render_scale_percent < 100 && levels == 1 &&
+            (desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) &&
+            !(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET))
+    {
+        short_side = min(width, height);
+        if (desc->DepthOrArraySize > 1 && short_side >= 1024)
+            *scale_percent = vkd3d_xrgame_config.render_scale_percent;
+    }
+}
+
+static void vkd3d_xrgame_note_reduced_image(struct d3d12_device *device, const struct d3d12_resource *resource,
+        const VkImageCreateInfo *image_info, VkImage vk_image)
+{
+    static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+    static uint64_t saved_total[2];
+    static uint32_t image_count[2];
+    const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+    VkDeviceImageMemoryRequirements full_info;
+    VkMemoryRequirements reduced_requirements;
+    VkMemoryRequirements2 full_requirements;
+    VkImageCreateInfo full_image;
+    uint64_t saved, total;
+    unsigned int kind;
+    uint32_t count;
+
+    full_image = *image_info;
+    full_image.extent.width = resource->desc.Width;
+    full_image.extent.height = resource->desc.Height;
+    full_image.mipLevels = image_info->mipLevels + resource->xrgame_mip_drop;
+
+    full_info.sType = VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS;
+    full_info.pNext = NULL;
+    full_info.pCreateInfo = &full_image;
+    full_info.planeAspect = 0;
+    full_requirements.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2;
+    full_requirements.pNext = NULL;
+    VK_CALL(vkGetDeviceImageMemoryRequirements(device->vk_device, &full_info, &full_requirements));
+    VK_CALL(vkGetImageMemoryRequirements(device->vk_device, vk_image, &reduced_requirements));
+
+    saved = full_requirements.memoryRequirements.size > reduced_requirements.size ?
+            full_requirements.memoryRequirements.size - reduced_requirements.size : 0;
+    kind = resource->xrgame_scale_percent ? 1 : 0;
+
+    pthread_mutex_lock(&mutex);
+    count = ++image_count[kind];
+    total = (saved_total[kind] += saved);
+    pthread_mutex_unlock(&mutex);
+
+    if (kind)
+    {
+        INFO("XRGame render scale %u%%: depth image %ux%ux%u -> %ux%u, saves %.1f MiB (%u images, %.1f MiB).\n",
+                resource->xrgame_scale_percent, (unsigned int)resource->desc.Width, resource->desc.Height,
+                resource->desc.DepthOrArraySize, image_info->extent.width, image_info->extent.height,
+                saved / (1024.0 * 1024.0), count, total / (1024.0 * 1024.0));
+    }
+    else if (count == 1 || !(count % 64))
+    {
+        INFO("XRGame texture quality: %u textures reduced, %.1f MiB saved (latest %ux%u, %u of %u levels kept).\n",
+                count, total / (1024.0 * 1024.0), (unsigned int)resource->desc.Width, resource->desc.Height,
+                image_info->mipLevels, full_image.mipLevels);
+    }
+}
+
 static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
         const D3D12_HEAP_PROPERTIES *heap_properties, D3D12_HEAP_FLAGS heap_flags,
         const D3D12_RESOURCE_DESC1 *desc, struct d3d12_resource *resource,
@@ -736,6 +852,7 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     VkImageCreateInfo *image_info = &create_info->image_info;
     const bool sparse_resource = !heap_properties;
+    uint32_t mip_drop, scale_percent;
     const struct vkd3d_format *format;
     bool disable_compression;
     bool use_concurrent;
@@ -916,6 +1033,29 @@ static HRESULT vkd3d_get_image_create_info(struct d3d12_device *device,
     }
 
     image_info->mipLevels = min(desc->MipLevels, max_miplevel_count(desc));
+
+    vkd3d_xrgame_get_reduction(heap_properties,
+            !!((resource ? resource->heap_flags : heap_flags) & D3D12_HEAP_FLAG_SHARED),
+            desc, format, &mip_drop, &scale_percent);
+
+    if (mip_drop)
+    {
+        image_info->extent.width = max(1u, image_info->extent.width >> mip_drop);
+        image_info->extent.height = max(1u, image_info->extent.height >> mip_drop);
+        image_info->mipLevels -= mip_drop;
+    }
+
+    if (scale_percent)
+    {
+        image_info->extent.width = vkd3d_xrgame_scale_extent(image_info->extent.width, scale_percent);
+        image_info->extent.height = vkd3d_xrgame_scale_extent(image_info->extent.height, scale_percent);
+    }
+
+    if (resource)
+    {
+        resource->xrgame_mip_drop = mip_drop;
+        resource->xrgame_scale_percent = scale_percent;
+    }
     image_info->samples = vk_samples_from_dxgi_sample_desc(&desc->SampleDesc);
     image_info->tiling = format->vk_image_tiling;
     image_info->initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -1198,6 +1338,9 @@ static HRESULT vkd3d_create_image(struct d3d12_device *device,
     }
 
     resource->format_compatibility_list = create_info.format_compat_list;
+
+    if (vr >= 0 && (resource->xrgame_mip_drop || resource->xrgame_scale_percent))
+        vkd3d_xrgame_note_reduced_image(device, resource, &create_info.image_info, *vk_image);
 
     return hresult_from_vk_result(vr);
 }
@@ -2819,6 +2962,37 @@ VkImageSubresource d3d12_resource_get_vk_subresource(const struct d3d12_resource
             resource->format, subresource_idx,
             resource->desc.MipLevels, d3d12_resource_desc_get_layer_count(&resource->desc),
             all_aspects);
+}
+
+/* Maps a D3D12 mip level to the Vulkan image. Returns false when the image leaves the level out. */
+bool d3d12_resource_xrgame_remap_mip(const struct d3d12_resource *resource, uint32_t *mip_level)
+{
+    if (*mip_level < resource->xrgame_mip_drop)
+        return false;
+
+    *mip_level -= resource->xrgame_mip_drop;
+    return true;
+}
+
+/* Maps a D3D12 mip range to the Vulkan image. levelCount becomes 0 when the image has none of it. */
+void d3d12_resource_xrgame_remap_range(const struct d3d12_resource *resource, VkImageSubresourceRange *range)
+{
+    uint32_t drop = resource->xrgame_mip_drop;
+    uint32_t end;
+
+    if (!drop)
+        return;
+
+    if (range->levelCount == VK_REMAINING_MIP_LEVELS)
+    {
+        range->baseMipLevel = range->baseMipLevel > drop ? range->baseMipLevel - drop : 0;
+        return;
+    }
+
+    end = range->baseMipLevel + range->levelCount;
+    end = end > drop ? end - drop : 0;
+    range->baseMipLevel = range->baseMipLevel > drop ? range->baseMipLevel - drop : 0;
+    range->levelCount = end > range->baseMipLevel ? end - range->baseMipLevel : 0;
 }
 
 static HRESULT d3d12_validate_resource_flags(D3D12_RESOURCE_FLAGS flags)
@@ -6480,6 +6654,26 @@ static struct vkd3d_view *vkd3d_create_texture_uav_view(struct d3d12_device *dev
     return vkd3d_view_map_create_view(&resource->view_map, device, &key);
 }
 
+static void vkd3d_xrgame_remap_view_mips(const struct d3d12_resource *resource, struct vkd3d_texture_view_desc *desc)
+{
+    VkImageSubresourceRange range;
+
+    range.baseMipLevel = min(desc->miplevel_idx, resource->desc.MipLevels);
+    range.levelCount = min(desc->miplevel_count, resource->desc.MipLevels - range.baseMipLevel);
+    d3d12_resource_xrgame_remap_range(resource, &range);
+
+    /* A view of left-out levels only reads the largest level the image keeps. */
+    if (!range.levelCount)
+    {
+        range.baseMipLevel = 0;
+        range.levelCount = 1;
+    }
+
+    desc->miplevel_idx = range.baseMipLevel;
+    desc->miplevel_count = range.levelCount;
+    desc->miplevel_clamp = max(0.0f, desc->miplevel_clamp - (float)resource->xrgame_mip_drop);
+}
+
 static struct vkd3d_view *vkd3d_create_texture_srv_view(struct d3d12_device *device,
         struct d3d12_resource *resource, const D3D12_SHADER_RESOURCE_VIEW_DESC *desc)
 {
@@ -6576,6 +6770,9 @@ static struct vkd3d_view *vkd3d_create_texture_srv_view(struct d3d12_device *dev
 
     if (key.u.texture.miplevel_count == VK_REMAINING_MIP_LEVELS)
         key.u.texture.miplevel_count = resource->desc.MipLevels - key.u.texture.miplevel_idx;
+
+    if (resource->xrgame_mip_drop)
+        vkd3d_xrgame_remap_view_mips(resource, &key.u.texture);
 
     vkd3d_texture_view_desc_fixup(device, &key.u.texture);
 
