@@ -23,6 +23,7 @@
 #include "vkd3d_shader_private.h"
 #include "vkd3d_utf8.h"
 #include "vkd3d_string.h"
+#include "vkd3d_platform.h"
 #include <inttypes.h>
 #include <stdio.h>
 #include <dxil_spirv_c.h>
@@ -234,6 +235,24 @@ static dxil_spv_bool dxil_remap_inner(
     }
 
     return DXIL_SPV_FALSE;
+}
+
+/* XRGAME_RENDER_SCALE_DEBUG (see vkd3d_xrgame_config): bit 2 leaves SV_Position alone (0x100 here),
+ * bit 4 the texel coordinates and bit 8 the size queries. */
+static unsigned int vkd3d_shader_xrgame_render_scale_flags(void)
+{
+    unsigned int debug = 0, flags = 0;
+    char env[16];
+
+    if (vkd3d_get_env_var("XRGAME_RENDER_SCALE_DEBUG", env, sizeof(env)))
+        debug = strtoul(env, NULL, 0);
+    if (debug & 2)
+        flags |= 0x100u;
+    if (debug & 4)
+        flags |= DXIL_SPV_XRGAME_RENDER_SCALE_NO_TEXEL_MAPPING;
+    if (debug & 8)
+        flags |= DXIL_SPV_XRGAME_RENDER_SCALE_NO_SIZE_QUERY;
+    return flags;
 }
 
 static dxil_spv_bool dxil_remap(const struct vkd3d_dxil_remap_userdata *remap,
@@ -1350,6 +1369,15 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
             num_root_descriptors++;
     }
 
+    /* XRGame render scale: the pass scale word follows the descriptor table offsets. */
+    if (shader_interface_info->xrgame_aux_binding && shader_interface_info->xrgame_pass_scale_offset &&
+            shader_interface_info->stage == VK_SHADER_STAGE_FRAGMENT_BIT)
+    {
+        max_size = shader_interface_info->xrgame_pass_scale_offset / sizeof(uint32_t) + 1;
+        if (max_size > root_constant_words)
+            root_constant_words = max_size;
+    }
+
     /* Root constants come after root descriptors. Offset the counts. */
     if (root_constant_words < num_root_descriptors * 2)
         root_constant_words = num_root_descriptors * 2;
@@ -1358,6 +1386,31 @@ int vkd3d_shader_compile_dxil(const struct vkd3d_shader_code *dxbc,
     if ((ret = vkd3d_dxil_converter_set_options(converter, shader_interface_info, compiler_args, quirks,
             spirv->meta.hash, NULL, raw_va_binding_count || num_root_descriptors)))
         goto end;
+
+    /* XRGame render scale. The tags live in the raw VA aux buffer, which embedded descriptors do not have. */
+    if (shader_interface_info->xrgame_aux_binding &&
+            !(shader_interface_info->flags & VKD3D_SHADER_INTERFACE_RAW_VA_ALIAS_DESCRIPTOR_BUFFER))
+    {
+        struct dxil_spv_option_xrgame_render_scale helper;
+
+        memset(&helper, 0, sizeof(helper));
+        helper.base.type = DXIL_SPV_OPTION_XRGAME_RENDER_SCALE;
+        helper.enabled = DXIL_SPV_TRUE;
+        helper.aux_desc_set = shader_interface_info->xrgame_aux_binding->set;
+        helper.aux_binding = shader_interface_info->xrgame_aux_binding->binding;
+        helper.pass_scale_word = UINT32_MAX;
+        helper.flags = vkd3d_shader_xrgame_render_scale_flags();
+        if (shader_interface_info->xrgame_pass_scale_offset &&
+                shader_interface_info->stage == VK_SHADER_STAGE_FRAGMENT_BIT &&
+                !(helper.flags & 0x100u))
+        {
+            helper.pass_scale_word = shader_interface_info->xrgame_pass_scale_offset / sizeof(uint32_t) -
+                    2 * num_root_descriptors;
+        }
+
+        if (dxil_spv_converter_add_option(converter, &helper.base) != DXIL_SPV_SUCCESS)
+            WARN("dxil-spirv does not support XRGAME_RENDER_SCALE.\n");
+    }
 
     remap_userdata.shader_interface_info = shader_interface_info;
     remap_userdata.shader_interface_local_info = NULL;

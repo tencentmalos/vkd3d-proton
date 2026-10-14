@@ -578,7 +578,7 @@ enum vkd3d_application_feature_override
 
 static enum vkd3d_application_feature_override vkd3d_application_feature_override;
 uint64_t vkd3d_config_flags;
-struct vkd3d_xrgame_config vkd3d_xrgame_config = {VKD3D_XRGAME_TEXTURE_QUALITY_HIGH, 100};
+struct vkd3d_xrgame_config vkd3d_xrgame_config = {VKD3D_XRGAME_TEXTURE_QUALITY_HIGH, 8, 0};
 struct vkd3d_shader_quirk_info vkd3d_shader_quirk_info_template;
 
 struct vkd3d_instance_application_meta
@@ -1311,16 +1311,25 @@ static void vkd3d_xrgame_config_init(void)
             vkd3d_xrgame_config.texture_quality = VKD3D_XRGAME_TEXTURE_QUALITY_LOW;
     }
 
+    /* The steps of shadPS4's internal scale. */
     if (vkd3d_get_env_var("XRGAME_RENDER_SCALE", env, sizeof(env)))
     {
         if (!strcmp(env, "75"))
-            vkd3d_xrgame_config.render_scale_percent = 75;
+            vkd3d_xrgame_config.render_scale_eighths = 6;
         else if (!strcmp(env, "50"))
-            vkd3d_xrgame_config.render_scale_percent = 50;
+            vkd3d_xrgame_config.render_scale_eighths = 4;
+        else if (!strcmp(env, "37.5"))
+            vkd3d_xrgame_config.render_scale_eighths = 3;
+        else if (!strcmp(env, "25"))
+            vkd3d_xrgame_config.render_scale_eighths = 2;
     }
 
-    INFO("XRGame texture quality %s, shadow render scale %u%%.\n",
-            quality_names[vkd3d_xrgame_config.texture_quality], vkd3d_xrgame_config.render_scale_percent);
+    if (vkd3d_get_env_var("XRGAME_RENDER_SCALE_DEBUG", env, sizeof(env)))
+        vkd3d_xrgame_config.render_scale_debug = strtoul(env, NULL, 0);
+
+    INFO("XRGame texture quality %s, render scale %u/8, debug %#x.\n",
+            quality_names[vkd3d_xrgame_config.texture_quality], vkd3d_xrgame_config.render_scale_eighths,
+            vkd3d_xrgame_config.render_scale_debug);
 }
 
 static void vkd3d_config_flags_init_once(void)
@@ -10331,6 +10340,9 @@ static void vkd3d_compute_shader_interface_key(struct d3d12_device *device)
         INFO("Using DXIL_SPIRV_CONFIG = %s\n", env);
         key = hash_fnv1_iterate_string(key, env);
     }
+
+    key = hash_fnv1_iterate_u32(key, vkd3d_xrgame_config.render_scale_eighths);
+    key = hash_fnv1_iterate_u32(key, vkd3d_xrgame_config.render_scale_debug);
 
     device->shader_interface_key = key;
 }

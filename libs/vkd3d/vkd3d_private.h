@@ -260,14 +260,29 @@ enum vkd3d_xrgame_texture_quality
 struct vkd3d_xrgame_config
 {
     enum vkd3d_xrgame_texture_quality texture_quality;
-    uint32_t render_scale_percent;
+    /* Render scale in eighths, as shadPS4's internal scale: 8, 6, 4, 3 or 2. */
+    uint32_t render_scale_eighths;
+    /* XRGAME_RENDER_SCALE_DEBUG, for diagnosis: 1 leaves shaders alone, 2 leaves SV_Position alone,
+     * 4 leaves texel coordinates alone, 8 leaves size queries alone. */
+    uint32_t render_scale_debug;
 };
 
 extern struct vkd3d_xrgame_config vkd3d_xrgame_config;
+/* High bits of the tag a scaled texture view leaves in the raw VA aux slot; shaders compare it. */
+#define VKD3D_XRGAME_TEXTURE_TAG_MAGIC 0x585247u
 
-static inline uint32_t vkd3d_xrgame_scale_extent(uint32_t size, uint32_t percent)
+static inline uint32_t vkd3d_xrgame_scale_extent(uint32_t size, uint32_t eighths)
 {
-    return max(1u, (uint32_t)(((uint64_t)size * percent + 99u) / 100u));
+    return max(1u, (uint32_t)(((uint64_t)size * eighths) / 8u));
+}
+
+/* Maps the D3D12 span [start, end) of a dimension `guest` texels long onto the `host` texels of a
+ * reduced image: starts round down, ends round up and stay inside the image. */
+static inline void vkd3d_xrgame_map_span(uint32_t start, uint32_t end, uint32_t guest, uint32_t host,
+        int32_t *host_start, int32_t *host_end)
+{
+    *host_start = (int32_t)(((uint64_t)start * host) / guest);
+    *host_end = (int32_t)min((uint64_t)host, ((uint64_t)end * host + guest - 1) / guest);
 }
 
 struct vkd3d_queue_timeline_trace_cookie
@@ -1181,8 +1196,8 @@ struct d3d12_resource
     /* XRGame texture quality: number of top D3D12 mip levels the Vulkan image leaves out.
      * D3D12 mip N is Vulkan mip N - xrgame_mip_drop. */
     uint32_t xrgame_mip_drop;
-    /* XRGame render scale of shadow-like depth images in percent, 0 when the image is not scaled. */
-    uint32_t xrgame_scale_percent;
+    /* XRGame render scale of render and depth targets in eighths, 0 when the image is not scaled. */
+    uint32_t xrgame_scale_eighths;
 
     struct vkd3d_private_store private_store;
     struct d3d_destruction_notifier destruction_notifier;
@@ -1963,6 +1978,9 @@ struct d3d12_root_signature
 
     uint32_t descriptor_table_offset;
     uint32_t descriptor_table_count;
+    /* XRGame render scale: byte offset of the current pass scale (in eighths, 0 when the pass is
+     * not scaled) in the push constants, right after the table offsets; 0 when there is none. */
+    uint32_t xrgame_pass_scale_offset;
 
     unsigned int static_sampler_count;
     D3D12_STATIC_SAMPLER_DESC1 *static_samplers_desc;
@@ -3269,8 +3287,9 @@ struct d3d12_command_list
     unsigned int fb_width;
     unsigned int fb_height;
     unsigned int fb_layer_count;
-    /* XRGame render scale of the bound depth image; viewports and scissors follow it. */
-    uint32_t xrgame_fb_scale_percent;
+    /* XRGame render scale of the bound render targets in eighths, 0 when they are not scaled;
+     * viewports and scissors follow it. */
+    uint32_t xrgame_fb_scale_eighths;
 
     unsigned int xfb_buffer_count;
 
@@ -6406,19 +6425,44 @@ static inline VkExtent3D d3d12_resource_desc_get_subresource_extent(const struct
     return d3d12_resource_desc_get_vk_subresource_extent(desc, format, &vk_subresource);
 }
 
+/* Width and height of Vulkan mip `vk_mip` of the resource's image, after the XRGame reductions. */
+static inline VkExtent3D d3d12_resource_xrgame_image_mip_extent(const struct d3d12_resource *resource, uint32_t vk_mip)
+{
+    uint32_t width = resource->desc.Width, height = resource->desc.Height;
+    VkExtent3D extent;
+
+    if (resource->xrgame_mip_drop)
+    {
+        width = max(1u, width >> resource->xrgame_mip_drop);
+        height = max(1u, height >> resource->xrgame_mip_drop);
+    }
+
+    if (resource->xrgame_scale_eighths)
+    {
+        width = vkd3d_xrgame_scale_extent(width, resource->xrgame_scale_eighths);
+        height = vkd3d_xrgame_scale_extent(height, resource->xrgame_scale_eighths);
+    }
+
+    extent.width = max(1u, width >> vk_mip);
+    extent.height = max(1u, height >> vk_mip);
+    extent.depth = 1;
+    return extent;
+}
+
 static inline VkExtent3D d3d12_resource_get_view_subresource_extent(const struct d3d12_resource *resource, const struct vkd3d_view *view)
 {
     VkImageSubresourceLayers vk_subresource = vk_subresource_layers_from_view(view);
-    VkExtent3D extent;
+    VkExtent3D extent, image_extent;
 
     /* Views address the Vulkan image; the description is in D3D12 terms. */
     vk_subresource.mipLevel += resource->xrgame_mip_drop;
     extent = d3d12_resource_desc_get_vk_subresource_extent(&resource->desc, resource->format, &vk_subresource);
 
-    if (resource->xrgame_scale_percent)
+    if (resource->xrgame_scale_eighths)
     {
-        extent.width = vkd3d_xrgame_scale_extent(extent.width, resource->xrgame_scale_percent);
-        extent.height = vkd3d_xrgame_scale_extent(extent.height, resource->xrgame_scale_percent);
+        image_extent = d3d12_resource_xrgame_image_mip_extent(resource, vk_subresource.mipLevel - resource->xrgame_mip_drop);
+        extent.width = image_extent.width;
+        extent.height = image_extent.height;
     }
 
     return extent;

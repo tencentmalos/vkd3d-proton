@@ -1673,6 +1673,9 @@ static void dxgi_vk_swap_chain_init_blit_pipeline(struct dxgi_vk_swap_chain *cha
 
     key.bind_point = VK_PIPELINE_BIND_POINT_GRAPHICS;
     key.filter = chain->desc.Scaling == DXGI_SCALING_NONE ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
+    /* XRGame render scale: back buffers are reduced and get stretched back when presented. */
+    if (vkd3d_xrgame_config.render_scale_eighths < 8)
+        key.filter = VK_FILTER_LINEAR;
     key.format = chain->present.backbuffer_format;
 
     if (FAILED(hr = vkd3d_meta_get_swapchain_pipeline(&device->meta_ops, &key, &chain->present.pipeline)))
@@ -2261,14 +2264,17 @@ static void dxgi_vk_swap_chain_record_render_pass(struct dxgi_vk_swap_chain *cha
 
     if (blit_command)
     {
+        VkExtent3D user_extent;
         VkImageBlit blit;
         memset(&blit, 0, sizeof(blit));
         blit.dstSubresource.layerCount = 1;
         blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         blit.srcSubresource = blit.dstSubresource;
 
-        blit.srcOffsets[1].x = (int)chain->desc.Width;
-        blit.srcOffsets[1].y = (int)chain->desc.Height;
+        /* The image may be smaller under the XRGame render scale. */
+        user_extent = d3d12_resource_xrgame_image_mip_extent(user_backbuffer, 0);
+        blit.srcOffsets[1].x = (int)user_extent.width;
+        blit.srcOffsets[1].y = (int)user_extent.height;
         blit.srcOffsets[1].z = 1;
 
         blit.dstOffsets[1].x = (int)chain->present.backbuffer_width;

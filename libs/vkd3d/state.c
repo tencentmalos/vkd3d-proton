@@ -716,6 +716,26 @@ static HRESULT d3d12_root_signature_init_push_constants(struct d3d12_root_signat
         }
     }
 
+    /* XRGame render scale: pixel shaders need the scale of the current pass to take SV_Position
+     * back to the application's coordinates. It follows the table offsets, so it is pushed with them.
+     * A root signature that already fills the push constant space goes without. */
+    root_signature->xrgame_pass_scale_offset = 0;
+    if (vkd3d_xrgame_config.render_scale_eighths < 8 && root_signature->descriptor_table_count)
+    {
+        if (push_constant_range->size + sizeof(uint32_t) <= min(
+                root_signature->device->device_info.properties2.properties.limits.maxPushConstantsSize,
+                (uint32_t)sizeof(union vkd3d_root_parameter_data)))
+        {
+            root_signature->xrgame_pass_scale_offset = push_constant_range->size;
+            push_constant_range->stageFlags |= VK_SHADER_STAGE_FRAGMENT_BIT;
+            push_constant_range->size += sizeof(uint32_t);
+        }
+        else
+        {
+            FIXME_ONCE("No push constant space for the XRGame pass scale, SV_Position stays unscaled.\n");
+        }
+    }
+
     return S_OK;
 }
 
@@ -2644,6 +2664,11 @@ static void d3d12_pipeline_state_init_shader_interface(struct d3d12_pipeline_sta
     shader_interface->push_constant_ubo_binding = &root_signature->push_constant_ubo_binding;
     shader_interface->offset_buffer_binding = &root_signature->offset_buffer_binding;
     shader_interface->stage = stage;
+    if (vkd3d_xrgame_config.render_scale_eighths < 8 && !(vkd3d_xrgame_config.render_scale_debug & 1))
+    {
+        shader_interface->xrgame_aux_binding = &root_signature->raw_va_aux_buffer_binding;
+        shader_interface->xrgame_pass_scale_offset = root_signature->xrgame_pass_scale_offset;
+    }
     shader_interface->xfb_info = state->pipeline_type == VKD3D_PIPELINE_TYPE_GRAPHICS &&
             stage == state->graphics.cached_desc.xfb_stage ?
             state->graphics.cached_desc.xfb_info : NULL;

@@ -326,6 +326,12 @@ struct vkd3d_shader_interface_info
     unsigned int root_parameter_mapping_count;
     const void *root_signature_blob;
     size_t root_signature_blob_size;
+
+    /* XRGame render scale: binding of the raw VA aux buffer that holds the texture tags,
+     * NULL when rendering is not scaled. */
+    const struct vkd3d_shader_descriptor_binding *xrgame_aux_binding;
+    /* Byte offset of the current pass scale in the push constants, 0 when there is none. */
+    uint32_t xrgame_pass_scale_offset;
 };
 
 struct vkd3d_shader_descriptor_table
