@@ -578,6 +578,7 @@ enum vkd3d_application_feature_override
 
 static enum vkd3d_application_feature_override vkd3d_application_feature_override;
 uint64_t vkd3d_config_flags;
+struct vkd3d_xrgame_config vkd3d_xrgame_config = {VKD3D_XRGAME_TEXTURE_QUALITY_HIGH};
 struct vkd3d_shader_quirk_info vkd3d_shader_quirk_info_template;
 
 struct vkd3d_instance_application_meta
@@ -1297,6 +1298,22 @@ static const struct vkd3d_debug_option vkd3d_config_options[] =
     {"no_nvx", VKD3D_CONFIG_FLAG_NO_NVX},
 };
 
+static void vkd3d_xrgame_config_init(void)
+{
+    static const char * const quality_names[] = {"high", "medium", "low"};
+    char env[64];
+
+    if (vkd3d_get_env_var("XRGAME_TEXTURE_QUALITY", env, sizeof(env)))
+    {
+        if (!strcmp(env, "medium"))
+            vkd3d_xrgame_config.texture_quality = VKD3D_XRGAME_TEXTURE_QUALITY_MEDIUM;
+        else if (!strcmp(env, "low"))
+            vkd3d_xrgame_config.texture_quality = VKD3D_XRGAME_TEXTURE_QUALITY_LOW;
+    }
+
+    INFO("XRGame texture quality %s.\n", quality_names[vkd3d_xrgame_config.texture_quality]);
+}
+
 static void vkd3d_config_flags_init_once(void)
 {
     char config[VKD3D_PATH_MAX];
@@ -1309,6 +1326,7 @@ static void vkd3d_config_flags_init_once(void)
 
     vkd3d_instance_deduce_config_flags_from_environment();
     vkd3d_instance_apply_global_shader_quirks();
+    vkd3d_xrgame_config_init();
 
     /* If we're going to use vk_debug, make sure we can get debug callbacks. */
     if (vkd3d_config_flags & VKD3D_CONFIG_FLAG_VULKAN_DEBUG)

@@ -9639,6 +9639,36 @@ static bool validate_d3d12_box(const D3D12_BOX *box)
             && box->back > box->front;
 }
 
+/* XRGame: copies address D3D12 mip levels, but the Vulkan image may leave out top levels
+ * (texture quality). The extents were computed in D3D12 terms, which stay valid for kept levels
+ * since those have the same sizes. Returns false when the copy has to be dropped. */
+static bool d3d12_command_list_xrgame_remap_copy(const struct d3d12_resource *src_resource,
+        const struct d3d12_resource *dst_resource, struct vkd3d_image_copy_info *info)
+{
+    switch (info->batch_type)
+    {
+        case VKD3D_BATCH_TYPE_COPY_BUFFER_TO_IMAGE:
+            return d3d12_resource_xrgame_remap_mip(dst_resource, &info->copy.buffer_image.imageSubresource.mipLevel);
+
+        case VKD3D_BATCH_TYPE_COPY_IMAGE_TO_BUFFER:
+            if (d3d12_resource_xrgame_remap_mip(src_resource, &info->copy.buffer_image.imageSubresource.mipLevel))
+                return true;
+            FIXME_ONCE("Readback of a mip level left out by the texture quality setting, skipping.\n");
+            return false;
+
+        case VKD3D_BATCH_TYPE_COPY_IMAGE:
+            if (!d3d12_resource_xrgame_remap_mip(dst_resource, &info->copy.image.dstSubresource.mipLevel))
+                return false;
+            if (d3d12_resource_xrgame_remap_mip(src_resource, &info->copy.image.srcSubresource.mipLevel))
+                return true;
+            FIXME_ONCE("Copy from a mip level left out by the texture quality setting, skipping.\n");
+            return false;
+
+        default:
+            return true;
+    }
+}
+
 static bool d3d12_command_list_init_copy_texture_region(struct d3d12_command_list *list,
         const D3D12_TEXTURE_COPY_LOCATION *dst,
         UINT dst_x, UINT dst_y, UINT dst_z,
@@ -9896,6 +9926,10 @@ static bool d3d12_command_list_init_copy_texture_region(struct d3d12_command_lis
         out->writes_full_resource = false;
         out->writes_full_subresource = false;
     }
+
+    if ((src_resource->xrgame_mip_drop || dst_resource->xrgame_mip_drop) &&
+            !d3d12_command_list_xrgame_remap_copy(src_resource, dst_resource, out))
+        return false;
 
     return true;
 }
@@ -10359,6 +10393,15 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyResource(d3d12_command_list
                     continue;
                 }
 
+                if ((src_resource->xrgame_mip_drop || dst_resource->xrgame_mip_drop) &&
+                        (!d3d12_resource_xrgame_remap_mip(dst_resource, &vk_image_copy.dstSubresource.mipLevel) ||
+                        !d3d12_resource_xrgame_remap_mip(src_resource, &vk_image_copy.srcSubresource.mipLevel)))
+                {
+                    if (i >= dst_resource->xrgame_mip_drop)
+                        FIXME_ONCE("CopyResource from a mip level left out by the texture quality setting, skipping.\n");
+                    continue;
+                }
+
                 /* Copying sampler feedback is only allowed in CopyResource. */
                 if (d3d12_resource_desc_is_sampler_feedback(&src_resource->desc))
                     vk_image_copy.extent = d3d12_resource_desc_get_padded_feedback_extent(&src_resource->desc);
@@ -10377,7 +10420,7 @@ static void STDMETHODCALLTYPE d3d12_command_list_CopyResource(d3d12_command_list
                 /* CopyResource() always copies all subresources, so we can safely discard the dst_resource contents. */
                 d3d12_command_list_barrier_batch_init(&barriers);
 
-                if (i == 0 && j == 0)
+                if (i == max(src_resource->xrgame_mip_drop, dst_resource->xrgame_mip_drop) && j == 0)
                 {
                     d3d12_command_list_check_and_resolve_pending_transfer_image_write(list, &barriers,
                             dst_resource->res.vk_image, UINT32_MAX);
@@ -11678,6 +11721,12 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResolveSubresource(d3d12_comman
     dst_resource = impl_from_ID3D12Resource(dst);
     src_resource = impl_from_ID3D12Resource(src);
 
+    if (dst_resource->xrgame_mip_drop || src_resource->xrgame_mip_drop)
+    {
+        FIXME_ONCE("Resolve with an image reduced by the XRGame texture quality, skipping.\n");
+        return;
+    }
+
     assert(d3d12_resource_is_texture(dst_resource));
     assert(d3d12_resource_is_texture(src_resource));
 
@@ -12928,7 +12977,19 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResourceBarrier(d3d12_command_l
                             transition_src_stage_mask, transition_src_access,
                             transition_dst_stage_mask, transition_dst_access,
                             dsv_decay_mask);
-                    d3d12_command_list_barrier_batch_add_layout_transition(list, &batch, &vk_transition);
+                    d3d12_resource_xrgame_remap_range(preserve_resource, &vk_transition.subresourceRange);
+
+                    /* A level the image leaves out only needs the memory dependency. */
+                    if (vk_transition.subresourceRange.levelCount)
+                    {
+                        d3d12_command_list_barrier_batch_add_layout_transition(list, &batch, &vk_transition);
+                    }
+                    else
+                    {
+                        d3d12_command_list_barrier_batch_add_global_transition(list, &batch,
+                                transition_src_stage_mask, transition_src_access,
+                                transition_dst_stage_mask, transition_dst_access);
+                    }
                 }
                 else
                 {
@@ -17990,6 +18051,12 @@ static void STDMETHODCALLTYPE d3d12_command_list_ResolveSubresourceRegion(d3d12_
         return;
     }
 
+    if (dst_resource->xrgame_mip_drop || src_resource->xrgame_mip_drop)
+    {
+        FIXME_ONCE("Resolve with an image reduced by the XRGame texture quality, skipping.\n");
+        return;
+    }
+
     assert(d3d12_resource_is_texture(dst_resource));
     assert(d3d12_resource_is_texture(src_resource));
 
@@ -20656,7 +20723,19 @@ static void d3d12_command_list_process_enhanced_barrier_texture(struct d3d12_com
     if (barrier->LayoutBefore == D3D12_BARRIER_LAYOUT_UNDEFINED && !(barrier->Flags & D3D12_TEXTURE_BARRIER_FLAG_DISCARD))
         FIXME("Transitioning away from UNDEFINED, but there is no DISCARD flag. Uncertain what is expected here. vkd3d-proton will force a discard.\n");
 
-    d3d12_command_list_barrier_batch_add_layout_transition(list, batch, &vk_transition);
+    d3d12_resource_xrgame_remap_range(resource, &vk_transition.subresourceRange);
+
+    /* A level the image leaves out only needs the memory dependency. */
+    if (vk_transition.subresourceRange.levelCount)
+    {
+        d3d12_command_list_barrier_batch_add_layout_transition(list, batch, &vk_transition);
+    }
+    else
+    {
+        d3d12_command_list_barrier_batch_add_global_transition(list, batch,
+                vk_transition.srcStageMask, vk_transition.srcAccessMask,
+                vk_transition.dstStageMask, vk_transition.dstAccessMask);
+    }
 
     discarding_transition = vk_transition.oldLayout == VK_IMAGE_LAYOUT_UNDEFINED &&
             vk_transition.newLayout != VK_IMAGE_LAYOUT_UNDEFINED &&

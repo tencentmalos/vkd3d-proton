@@ -248,6 +248,22 @@ struct vkd3d_instance
 
 extern uint64_t vkd3d_config_flags;
 
+/* XRGame texture quality, read once from XRGAME_TEXTURE_QUALITY. The application keeps seeing its
+ * own resource descriptions; only the Vulkan images shrink. */
+enum vkd3d_xrgame_texture_quality
+{
+    VKD3D_XRGAME_TEXTURE_QUALITY_HIGH = 0,
+    VKD3D_XRGAME_TEXTURE_QUALITY_MEDIUM = 1,
+    VKD3D_XRGAME_TEXTURE_QUALITY_LOW = 2,
+};
+
+struct vkd3d_xrgame_config
+{
+    enum vkd3d_xrgame_texture_quality texture_quality;
+};
+
+extern struct vkd3d_xrgame_config vkd3d_xrgame_config;
+
 struct vkd3d_queue_timeline_trace_cookie
 {
     unsigned int index;
@@ -1156,6 +1172,10 @@ struct d3d12_resource
 
     VkImageView vrs_view;
 
+    /* XRGame texture quality: number of top D3D12 mip levels the Vulkan image leaves out.
+     * D3D12 mip N is Vulkan mip N - xrgame_mip_drop. */
+    uint32_t xrgame_mip_drop;
+
     struct vkd3d_private_store private_store;
     struct d3d_destruction_notifier destruction_notifier;
 };
@@ -1204,6 +1224,8 @@ HRESULT d3d12_resource_validate_desc(const D3D12_RESOURCE_DESC1 *desc,
         struct d3d12_device *device);
 VkImageSubresource d3d12_resource_get_vk_subresource(const struct d3d12_resource *resource,
         uint32_t subresource_idx, bool all_aspects);
+bool d3d12_resource_xrgame_remap_mip(const struct d3d12_resource *resource, uint32_t *mip_level);
+void d3d12_resource_xrgame_remap_range(const struct d3d12_resource *resource, VkImageSubresourceRange *range);
 VkImageAspectFlags vk_image_aspect_flags_from_d3d12(
         const struct vkd3d_format *format, uint32_t plane_idx);
 VkImageSubresource vk_image_subresource_from_d3d12(
@@ -6377,6 +6399,9 @@ static inline VkExtent3D d3d12_resource_desc_get_subresource_extent(const struct
 static inline VkExtent3D d3d12_resource_get_view_subresource_extent(const struct d3d12_resource *resource, const struct vkd3d_view *view)
 {
     VkImageSubresourceLayers vk_subresource = vk_subresource_layers_from_view(view);
+
+    /* Views address the Vulkan image; the description is in D3D12 terms. */
+    vk_subresource.mipLevel += resource->xrgame_mip_drop;
     return d3d12_resource_desc_get_vk_subresource_extent(&resource->desc, resource->format, &vk_subresource);
 }
 
